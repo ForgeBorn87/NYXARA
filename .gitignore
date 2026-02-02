@@ -5,3 +5,4 @@ __pycache__/
 *.json
 static/audio/
 .elevenlabs_key
+models/
