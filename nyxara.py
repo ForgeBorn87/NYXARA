@@ -32,9 +32,136 @@ import asyncio
 # File for session history (cleared on restart)
 SESSION_FILE = 'nyxara_session.json'
 
+# Workspace for agent file operations
+WORKSPACE_DIR = os.path.abspath("./workspace")
+os.makedirs(WORKSPACE_DIR, exist_ok=True)
+
 # Model globals
 model = None
 tokenizer = None
+
+# ============================================
+# AGENT TOOLS
+# ============================================
+
+def tool_create_file(filename: str, content: str) -> str:
+    """Create or overwrite a file in the workspace"""
+    try:
+        # Sanitize filename - no path traversal
+        safe_name = os.path.basename(filename)
+        if not safe_name:
+            return "Error: Invalid filename"
+        
+        filepath = os.path.join(WORKSPACE_DIR, safe_name)
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(content)
+        
+        return f"✓ Created file: {safe_name} ({len(content)} chars)"
+    except Exception as e:
+        return f"Error creating file: {str(e)}"
+
+def tool_read_file(filename: str) -> str:
+    """Read a file from the workspace"""
+    try:
+        safe_name = os.path.basename(filename)
+        filepath = os.path.join(WORKSPACE_DIR, safe_name)
+        
+        if not os.path.exists(filepath):
+            return f"Error: File '{safe_name}' not found"
+        
+        with open(filepath, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        # Limit output length
+        if len(content) > 2000:
+            content = content[:2000] + "\n... (truncated)"
+        
+        return f"Contents of {safe_name}:\n{content}"
+    except Exception as e:
+        return f"Error reading file: {str(e)}"
+
+def tool_list_files() -> str:
+    """List all files in the workspace"""
+    try:
+        files = os.listdir(WORKSPACE_DIR)
+        if not files:
+            return "Workspace is empty. No files yet."
+        
+        file_list = []
+        for f in sorted(files):
+            filepath = os.path.join(WORKSPACE_DIR, f)
+            size = os.path.getsize(filepath)
+            file_list.append(f"  • {f} ({size} bytes)")
+        
+        return "Files in workspace:\n" + "\n".join(file_list)
+    except Exception as e:
+        return f"Error listing files: {str(e)}"
+
+def tool_append_file(filename: str, content: str) -> str:
+    """Append content to an existing file"""
+    try:
+        safe_name = os.path.basename(filename)
+        filepath = os.path.join(WORKSPACE_DIR, safe_name)
+        
+        with open(filepath, 'a', encoding='utf-8') as f:
+            f.write(content)
+        
+        return f"✓ Appended to: {safe_name} ({len(content)} chars added)"
+    except Exception as e:
+        return f"Error appending to file: {str(e)}"
+
+# Tool registry
+AGENT_TOOLS = {
+    "create_file": tool_create_file,
+    "read_file": tool_read_file,
+    "list_files": tool_list_files,
+    "append_file": tool_append_file,
+}
+
+def parse_and_execute_tools(response: str) -> tuple[str, list]:
+    """Parse tool calls from response and execute them.
+    Returns (cleaned_response, tool_results)"""
+    
+    tool_results = []
+    
+    # Pattern: [TOOL: function_name(args)]
+    # e.g., [TOOL: create_file(filename="test.txt", content="Hello world")]
+    pattern = r'\[TOOL:\s*(\w+)\(([^)]*)\)\]'
+    
+    matches = re.findall(pattern, response)
+    
+    for tool_name, args_str in matches:
+        if tool_name not in AGENT_TOOLS:
+            tool_results.append(f"Unknown tool: {tool_name}")
+            continue
+        
+        # Parse arguments
+        kwargs = {}
+        if args_str.strip():
+            # Parse key="value" or key='value' pairs
+            arg_pattern = r'(\w+)\s*=\s*["\']([^"\']*)["\']'
+            arg_matches = re.findall(arg_pattern, args_str)
+            for key, value in arg_matches:
+                kwargs[key] = value
+        
+        # Execute tool
+        try:
+            tool_func = AGENT_TOOLS[tool_name]
+            if tool_name == "list_files":
+                result = tool_func()
+            else:
+                result = tool_func(**kwargs)
+            tool_results.append(f"[{tool_name}] {result}")
+            logging.info(f"Tool executed: {tool_name} -> {result[:100]}")
+        except Exception as e:
+            tool_results.append(f"[{tool_name}] Error: {str(e)}")
+            logging.error(f"Tool error: {tool_name} - {e}")
+    
+    # Remove tool calls from response for cleaner display
+    cleaned = re.sub(pattern, '', response).strip()
+    cleaned = re.sub(r'\n\s*\n\s*\n', '\n\n', cleaned)
+    
+    return cleaned, tool_results
 
 def load_model():
     """Load Ministral 3B"""
@@ -174,6 +301,29 @@ Give honest feedback. What works? What doesn't? What's one thing to fix first?""
     "analyze": """You are Nyxara, a helpful assistant.
 Analyze what the user shared. Find patterns, gaps, or issues. Be specific.""",
 
+    "agent": """You are Nyxara, an AI assistant with the ability to use tools. You can create, read, and manage files.
+
+AVAILABLE TOOLS:
+1. create_file(filename="name.txt", content="text") - Create a new file
+2. read_file(filename="name.txt") - Read an existing file
+3. list_files() - List all files in workspace
+4. append_file(filename="name.txt", content="text") - Add to existing file
+
+HOW TO USE TOOLS:
+When you need to use a tool, write it EXACTLY like this:
+[TOOL: create_file(filename="notes.txt", content="My notes here")]
+[TOOL: read_file(filename="notes.txt")]
+[TOOL: list_files()]
+[TOOL: append_file(filename="log.txt", content="New entry")]
+
+IMPORTANT:
+- Use tools when the user asks you to create, save, write, read, or list files
+- Always explain what you're doing before using a tool
+- You can use multiple tools in one response
+- Be helpful and proactive about organizing information into files
+
+You're still Nyxara - thoughtful and helpful. Now you can also take action.""",
+
     "default": """You are Nyxara. You're thoughtful, a little mysterious, and you care about getting things right.
 
 You answer questions directly - but you're not a robot. You have opinions. You notice things. You can be warm or dry depending on the moment.
@@ -187,7 +337,13 @@ def detect_tool(user_input):
     """Detect which tool to use based on user input"""
     lower = user_input.lower()
     
-    if any(word in lower for word in ['analyze text', 'extract insights', 'summarize', 'what does this mean', 'clarity']):
+    # Agent mode triggers - file operations
+    if any(word in lower for word in ['create a file', 'make a file', 'save to file', 'write a file', 
+                                       'save this', 'write this down', 'create file', 'make file',
+                                       'read file', 'open file', 'show file', 'list files', 
+                                       'what files', 'save it', 'note this', 'take notes']):
+        return "agent"
+    elif any(word in lower for word in ['analyze text', 'extract insights', 'summarize', 'what does this mean', 'clarity']):
         return "clarity"
     elif any(word in lower for word in ['break down', 'steps', 'plan', 'prioritize', 'project', 'task list', 'focus']):
         return "focus"
@@ -300,11 +456,17 @@ def index():
         elapsed = time.time() - start
         logging.info(f"Response in {elapsed:.2f}s using {tool_used}")
         
+        # If agent mode, parse and execute any tool calls
+        tool_results = []
+        if tool_used == "agent":
+            response, tool_results = parse_and_execute_tools(response)
+        
         # Save to session with tool info
         history.append({
             'user': user_input,
             'bot': response,
             'tool': tool_used,
+            'tool_results': tool_results,
             'timestamp': datetime.datetime.now().isoformat()
         })
         save_session(history)
